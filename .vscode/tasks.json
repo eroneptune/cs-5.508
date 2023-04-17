@@ -1,0 +1,13 @@
+{
+  "tasks": [
+    {
+      "label": "build wc.so",
+      "type": "shell",
+      "command": "go build -race -buildmode=plugin -gcflags=\"all=-N -l\"  ../mrapps/wc.go",
+      "options": {
+        "cwd": "${workspaceFolder}/src/main"
+      }
+    },
+  ],
+  "version": "2.0.0"
+}
