@@ -6,24 +6,12 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
-
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
+import (
+	"os"
+	"strconv"
+)
 
 // Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
@@ -33,4 +21,37 @@ func coordinatorSock() string {
 	s := "/var/tmp/5840-mr-"
 	s += strconv.Itoa(os.Getuid())
 	return s
+}
+
+const (
+	READY_FOR_MAPPING = iota // 有map任务，可以进行map
+	MAPPING
+	READY_FOR_REDUCING // 有reduce任务，可以进行reduce
+	REDUCING
+	COMPLETED // 所有reduce任务都被分配，空闲
+)
+
+const (
+	IDLE_WORKER = iota
+	MAPPING_WORKER
+	REDUCING_WORKER
+)
+
+const (
+	INVALID_WORKER_ID = -1
+)
+
+const (
+	INVALID_TASK_ID = -1
+)
+
+type RequestArgs struct {
+	WorkerId int
+	status   int
+}
+
+type RequestReply struct {
+	Worker  WorkerInfo
+	Task    Task
+	NReduce int
 }
