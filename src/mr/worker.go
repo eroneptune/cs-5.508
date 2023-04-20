@@ -36,114 +36,195 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// main/mrworker.go calls this function.
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+type AWorker struct {
+	task    *Task
+	mapf    func(string, string) []KeyValue
+	reducef func(string, []string) string
+	status  int
+	ticker  *time.Ticker
+}
 
-	reply := RequestReply{}
-	registerSuccess := call("Coordinator.Register", &RequestArgs{}, &reply)
-	if !registerSuccess {
-		fmt.Printf("register failed!\n")
+// handle map
+func (w *AWorker) handleMap() {
+	// read from file
+	fileName := w.task.FileName
+	content, err := readFile(fileName)
+	if err != nil {
+		log.Fatalf("<handleMap> Failed to read file: %s", fileName)
 	}
 
-	worker := WorkerInfo{reply.Worker.WorkerId, IDLE_WORKER, INVALID_TASK_ID, time.Now().Unix()}
-	args := RequestArgs{worker.WorkerId, IDLE_WORKER}
+	// do map
+	kva := w.mapf(w.task.FileName, string(content))
 
+	// write intermediate to file
+	writeIntermediate(kva, w.task.MapId, w.task.NReduce)
+}
+
+func writeIntermediate(kva []KeyValue, mapId int, nReduce int) {
+	intermediate := make(map[int][]KeyValue)
+	for idx := range kva {
+		i := ihash(kva[idx].Key) % nReduce // reduceId
+		intermediate[i] = append(intermediate[i], kva[idx])
+	}
+
+	writeToFile := func(k int) {
+		oname := fmt.Sprintf("mr-%d-%d", mapId, k)
+		ofile, err := os.Create(oname)
+		defer ofile.Close()
+		if err != nil {
+			log.Fatalf("Failed to create file: %s", oname)
+			return
+		}
+		bytes, err := json.Marshal(intermediate[k])
+		if err != nil {
+			log.Fatalf("Failed to marshal value")
+			return
+		}
+		fmt.Fprintf(ofile, "%v\n", string(bytes))
+	}
+
+	for k := range intermediate {
+		writeToFile(k)
+	}
+}
+
+// handle reduce
+func (w *AWorker) handleReduce() {
+	// read intermediate from file
+	allKva := w.readIntermediate()
+
+	// sort
+	sort.Sort(ByKey(allKva))
+
+	// do reduce and write to file
+	reduceId := w.task.ReduceId
+	oname := "mr-out-" + strconv.Itoa(reduceId)
+	ofile, err := os.Create(oname)
+	defer ofile.Close()
+	if err != nil {
+		log.Fatalf("Failed to create file: %s", oname)
+	}
+
+	for i := 0; i < len(allKva); {
+		j := i + 1
+		for j < len(allKva) && allKva[j].Key == allKva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, allKva[k].Value)
+		}
+		output := w.reducef(allKva[i].Key, values)
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", allKva[i].Key, output)
+		i = j
+	}
+}
+
+func (w *AWorker) readIntermediate() (allKva []KeyValue) {
+	// read intermediate
+	reduceId := w.task.ReduceId
+	allKva = make([]KeyValue, 0)
+	for i := 0; i < w.task.NFiles; i++ {
+		ifile := fmt.Sprintf("mr-%d-%d", i, reduceId)
+		content, err := readFile(ifile)
+		if err != nil {
+			continue
+		}
+		kva := []KeyValue{}
+		err = json.Unmarshal([]byte(content), &kva)
+		if err != nil {
+			log.Printf("[Worker] Failed to unmarshal json: %s", content)
+			continue
+		}
+		allKva = append(allKva, kva...)
+	}
+	return
+}
+
+func (w *AWorker) process() {
 	for {
-		reply := RequestReply{}
-		ok := call("Coordinator.Call", &args, &reply)
-		if !ok {
+		args := &RequestForTaskArgs{}
+		reply := &RequestForTaskReply{}
+		// Task done
+		if w.task != nil {
+			args.TaskId = w.task.TaskId
+			args.Status = TaskStatusCompleted
+			log.Printf("[Worker] complete task %d", args.TaskId)
+		}
+		if !call("Coordinator.RequestForTask", args, reply) {
+			log.Println("Call Coordinator.RequestForTask Error")
 			break
-		} else {
-			if reply.NReduce == -1 {
+		}
+		if reply.Done {
+			break
+		}
 
-				// sleep 500ms
-				time.Sleep(500 * time.Millisecond)
-			} else if reply.Worker.Status == MAPPING_WORKER {
-				// map
-				content, err := readFile(reply.Task.FileName)
-				if err != nil {
-					// TODO
-					return
-				}
-				kva := mapf(strconv.Itoa(reply.Task.TaskId), content)
-				hashIntermediate(kva, reply.Task.TaskId, reply.NReduce)
-			} else if reply.Worker.Status == REDUCING_WORKER {
-				// reduce
-				// reply.Task.reduceId  => reduceId
-				// reply.Task.TaskId		=> max taskId
-				reduceId := reply.Task.ReduceId
-				allKva := make([]KeyValue, 0)
-				for i := 0; i < reply.Task.FileSum; i++ {
-					content, err := readFile("mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reduceId))
-					if err != nil {
-						// TODO
-						fmt.Println("error")
-						return
-					}
-					kva := []KeyValue{}
-					err = json.Unmarshal([]byte(content), &kva)
-					if err != nil {
-						// TODO
-						return
-					}
-					allKva = append(allKva, kva...)
-				}
-				sort.Sort(ByKey(allKva))
-				oname := "mr-out-" + strconv.Itoa(reduceId)
-				ofile, _ := os.Create(oname)
-				i := 0
-				for i < len(allKva) {
-					j := i + 1
-					for j < len(allKva) && allKva[j].Key == allKva[i].Key {
-						j++
-					}
-					values := []string{}
-					for k := i; k < j; k++ {
-						values = append(values, allKva[k].Value)
-					}
-					output := reducef(allKva[i].Key, values)
-					// this is the correct format for each line of Reduce output.
-					fmt.Fprintf(ofile, "%v %v\n", allKva[i].Key, output)
-					i = j
-				}
-				ofile.Close()
+		w.task = &reply.Task
 
-			}
+		switch reply.Ttype {
+		case TaskTypeMap:
+			log.Printf("[Worker] Receive map task id: %d", w.task.TaskId)
+			w.startTicker()
+			w.handleMap()
+			w.ticker.Stop()
+		case TaskTypeReduce:
+			log.Printf("[Worker] Receive reduce task id: %d", w.task.TaskId)
+			w.startTicker()
+			w.handleReduce()
+			w.ticker.Stop()
+		case TaskTypeNone:
+			log.Printf("[Worker] Receive type none")
+			time.Sleep(time.Second)
+		default:
+			log.Printf("[Worker] Unknown task type: %d\n", reply.Ttype)
 		}
 	}
 }
 
-func hashIntermediate(kva []KeyValue, taskId int, nReduce int) {
-	intermediate := make(map[int][]KeyValue)
-	for _, val := range kva {
-		i := ihash(val.Key) % nReduce // reduceId
-		intermediate[i] = append(intermediate[i], val)
+// main/mrworker.go calls this function.
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	worker := &AWorker{
+		mapf:    mapf,
+		reducef: reducef,
+		ticker:  time.NewTicker(time.Second),
 	}
-	for k, v := range intermediate {
-		oname := "mr-" + strconv.Itoa(taskId) + "-" + strconv.Itoa(k)
-		ofile, _ := os.Create(oname)
-		bytes, _ := json.Marshal(v)
-		stringData := string(bytes)
-		fmt.Fprintf(ofile, "%v\n", stringData)
-		ofile.Close()
+	worker.process()
+	worker.ticker.Stop()
+}
+
+func (w *AWorker) startTicker() {
+	go func() {
+		for {
+			select {
+			case <-w.ticker.C:
+				w.heartbeat()
+			}
+		}
+	}()
+}
+
+func (w *AWorker) heartbeat() {
+	args := &PingArgs{
+		TaskId: w.task.TaskId,
 	}
+
+	reply := &PingReply{}
+	call("Coordinator.Ping", &args, &reply)
 }
 
 func readFile(fileName string) (string, error) {
-	fmt.Println(fileName)
-	result := ""
 	file, err := os.Open(fileName)
+	defer file.Close()
+
 	if err != nil {
 		return "", errors.New("cannot open " + fileName)
 	}
 	content, err := ioutil.ReadAll(file)
-	result = result + string(content)
 	if err != nil {
 		return "", errors.New("cannot read " + fileName)
 	}
-	file.Close()
-	return result, nil
+	return string(content), nil
 }
 
 // send an RPC request to the coordinator, wait for the response.

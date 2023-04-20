@@ -18,40 +18,43 @@ import (
 // Can't use the current directory since
 // Athena AFS doesn't support UNIX-domain sockets.
 func coordinatorSock() string {
-	s := "/var/tmp/5840-mr-"
+	s := "/var/tmp/5840.1-mr-"
 	s += strconv.Itoa(os.Getuid())
 	return s
 }
 
 const (
-	READY_FOR_MAPPING = iota // 有map任务，可以进行map
-	MAPPING
-	READY_FOR_REDUCING // 有reduce任务，可以进行reduce
-	REDUCING
-	COMPLETED // 所有reduce任务都被分配，空闲
+	TaskStatusCreated = iota
+	TaskStatusRunning
+	TaskStatusCompleted
 )
 
 const (
-	IDLE_WORKER = iota
-	MAPPING_WORKER
-	REDUCING_WORKER
+	MRStatusMapping = iota
+	MRStatusReducing
+	MRStatusCompleted
 )
 
 const (
-	INVALID_WORKER_ID = -1
+	TaskTypeNone = iota
+	TaskTypeMap
+	TaskTypeReduce
 )
 
-const (
-	INVALID_TASK_ID = -1
-)
-
-type RequestArgs struct {
-	WorkerId int
-	status   int
+type RequestForTaskArgs struct {
+	TaskId int
+	Status int
 }
 
-type RequestReply struct {
-	Worker  WorkerInfo
-	Task    Task
-	NReduce int
+type RequestForTaskReply struct {
+	Task
+	Ttype int
+	Done  bool
+}
+
+type PingArgs struct {
+	TaskId int
+}
+
+type PingReply struct {
 }

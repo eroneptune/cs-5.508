@@ -1,8 +1,6 @@
 package mr
 
 import (
-	"errors"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -12,186 +10,105 @@ import (
 	"time"
 )
 
-type Coordinator struct {
-	// Your definitions here.
-	mapList       []Task
-	mapMutex      sync.Mutex
-	reduceList    []Task
-	reduceMutex   sync.Mutex
-	completeList  []Task
-	completeMutex sync.Mutex
+type NoOutput struct {
+}
 
-	workerList  []WorkerInfo
-	workerMutex sync.Mutex
-	maxWorkerId int
-	IdMutex     sync.Mutex
+func (n *NoOutput) Write(b []byte) (int, error) {
+	return 0, nil
+}
+
+func init() {
+	log.SetOutput(&NoOutput{})
+}
+
+type Coordinator struct {
+	mapTasks chan *Task
+	allTasks map[int]*Task
+	mu       sync.RWMutex
+
+	files     []string
+	maxTaskId int
 
 	nReduce  int
 	mrStatus int
-	fileSums int
-}
 
-type WorkerInfo struct {
-	WorkerId      int
-	Status        int
-	CurrentTaskId int
-	timestamp     int64
+	ticker *time.Ticker
 }
 
 type Task struct {
-	TaskId   int
-	ReduceId int
-	FileSum  int
-	Status   int
-	FileName string
+	TaskId     int
+	MapId      int
+	ReduceId   int
+	Status     int
+	NFiles     int
+	NReduce    int
+	FileName   string
+	LastActive int64
 }
 
-func (c *Coordinator) Call(args *RequestArgs, reply *RequestReply) error {
-	worker := c.fetchWorker(args.WorkerId)
-	if worker == nil {
-		return errors.New("Invalid WorkerId")
-	}
-	worker.timestamp = time.Now().Unix()
-
-	if worker.CurrentTaskId != INVALID_TASK_ID {
-		e := c.updateWorkerAndTask(worker)
-		if e != nil {
-			return e
+func (c *Coordinator) releaseTask(taskId int) int {
+	res := c.mrStatus
+	delete(c.allTasks, taskId)
+	if len(c.allTasks) == 0 {
+		if c.mrStatus == MRStatusMapping {
+			c.mrStatus = MRStatusReducing
+			log.Printf("[Coordinator] Set c to reducing phase\n")
+			c.createReduceTasks()
+			res = MRStatusReducing
+		} else if c.mrStatus == MRStatusReducing {
+			c.mrStatus = MRStatusCompleted
+			log.Println("[Coordinator] Done")
+			// cleanup
+			close(c.mapTasks)
+			res = MRStatusCompleted
 		}
 	}
-	task := c.allocTask()
-	if task == nil {
-		// TODO
-		reply.NReduce = -1
-		reply.Worker = *worker
+
+	return res
+}
+
+func (c *Coordinator) RequestForTask(args *RequestForTaskArgs, reply *RequestForTaskReply) error {
+	if c.mrStatus == MRStatusCompleted {
+		reply.Done = true
 		return nil
 	}
-	worker.CurrentTaskId = task.TaskId
-	worker.Status = c.mrStatus
-
-	reply.Worker = *worker
-	reply.Task = *task
-	reply.NReduce = c.nReduce
-	if worker.Status == REDUCING_WORKER {
-		fmt.Println(reply.Task.TaskId, reply.Task.ReduceId, reply.Task.FileSum)
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	return nil
-}
-
-func (c *Coordinator) Register(args *RequestArgs, reply *RequestReply) error {
-	worker := WorkerInfo{c.maxWorkerId, IDLE_WORKER, INVALID_TASK_ID, time.Now().Unix()}
-	c.workerList = append(c.workerList, worker)
-	c.maxWorkerId += 1
-	reply.Worker = worker
-	return nil
-}
-
-func (c *Coordinator) PingPong(args *RequestArgs, reply *RequestReply) error {
-	worker := c.fetchWorker(args.WorkerId)
-	if worker == nil {
-		return errors.New("Invalid WorkerId")
-	}
-	worker.timestamp = time.Now().Unix()
-	return nil
-}
-
-func (c *Coordinator) updateWorkerAndTask(worker *WorkerInfo) error {
-	task := c.fetchTask(worker.CurrentTaskId)
-	if task == nil {
-		return errors.New("Invalid TaskId")
-	}
-
-	worker.Status = IDLE_WORKER
-	worker.CurrentTaskId = INVALID_TASK_ID
-
-	if task.Status == MAPPING {
-		task.Status = READY_FOR_REDUCING
-		c.mapToReduce(task.TaskId)
-	} else if task.Status == REDUCING {
-		task.Status = COMPLETED
-		c.reduceToComplete(task.TaskId)
-	}
-
-	return nil
-}
-
-func (c *Coordinator) mapToReduce(taskId int) {
-	var index int
-	for i, task := range c.mapList {
-		if task.TaskId == taskId {
-			index = i
-			break
+	if args.Status == TaskStatusCompleted {
+		c.mu.Lock()
+		status := c.releaseTask(args.TaskId)
+		c.mu.Unlock()
+		if status == MRStatusCompleted {
+			reply.Done = true
+			return nil
 		}
 	}
 
-	c.mapList = append(c.mapList[:index], c.mapList[(index+1):]...)
-	if len(c.mapList) == 0 {
-		c.createReduceTask()
-		c.mrStatus = REDUCING_WORKER
-		fmt.Println("finish")
-	}
-}
-
-func (c *Coordinator) reduceToComplete(taskId int) {
-	var index int
-	for i, task := range c.reduceList {
-		if task.TaskId == taskId {
-			index = i
-			break
-		}
-	}
-
-	c.reduceList = append(c.reduceList[:index], c.reduceList[(index+1):]...)
-	if len(c.reduceList) == 0 {
-		c.mrStatus = IDLE_WORKER
-	}
-}
-
-func (c *Coordinator) fetchWorker(workerId int) *WorkerInfo {
-	for index := range c.workerList {
-		if c.workerList[index].WorkerId == workerId {
-			return &c.workerList[index]
-		}
-	}
-	return nil
-}
-
-func (c *Coordinator) fetchTask(taskId int) *Task {
-	if c.mrStatus == MAPPING_WORKER {
-		for index := range c.mapList {
-			if c.mapList[index].TaskId == taskId {
-				return &c.mapList[index]
+	if task, ok := <-c.mapTasks; ok {
+		c.mu.Lock()
+		if _, ok = c.allTasks[task.TaskId]; ok {
+			task.LastActive = time.Now().Unix()
+			task.Status = TaskStatusRunning
+			reply.Task = *task
+			if task.FileName == "" { // 最好直接使用type来区分
+				reply.Ttype = TaskTypeReduce
+			} else {
+				reply.Ttype = TaskTypeMap
 			}
 		}
-	} else if c.mrStatus == REDUCING_WORKER {
-		for index := range c.reduceList {
-			if c.reduceList[index].TaskId == taskId {
-				return &c.reduceList[index]
-			}
-		}
+		c.mu.Unlock()
+	} else {
+		reply.Ttype = TaskTypeNone
 	}
 
 	return nil
 }
 
-func (c *Coordinator) allocTask() *Task {
-	// need refactor
-	if c.mrStatus == MAPPING_WORKER {
-		for index := range c.mapList {
-			if c.mapList[index].Status == READY_FOR_MAPPING {
-				c.mapList[index].Status = MAPPING
-				return &c.mapList[index]
-			}
-		}
-	} else if c.mrStatus == REDUCING_WORKER {
-		for index := range c.reduceList {
-			if c.reduceList[index].Status == READY_FOR_REDUCING {
-				c.reduceList[index].Status = REDUCING
-				return &c.reduceList[index]
-			}
-		}
+func (c *Coordinator) Ping(args *PingArgs, reply *PingReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	taskId := args.TaskId
+	if task, ok := c.allTasks[taskId]; ok {
+		task.LastActive = time.Now().Unix()
 	}
 
 	return nil
@@ -214,35 +131,81 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	// Your code here.
-	return c.mrStatus == IDLE_WORKER
+	return c.mrStatus == MRStatusCompleted
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-	c.nReduce = nReduce
-	c.maxWorkerId = 0
-	c.mrStatus = MAPPING_WORKER
-	c.fileSums = len(files)
-	// Your code here.
-	c.createMapTask(files)
+	nfiles := len(files)
+	c := &Coordinator{
+		mapTasks:  make(chan *Task, nfiles+10),
+		allTasks:  make(map[int]*Task),
+		nReduce:   nReduce,
+		maxTaskId: 0,
+		files:     files,
+		mrStatus:  MRStatusMapping,
+		ticker:    time.NewTicker(3 * time.Second),
+	}
+
+	c.createMapTasks()
+	go func() {
+		for {
+			select {
+			case <-c.ticker.C:
+				c.cleanIdleTasks()
+			}
+		}
+	}()
 	c.server()
-	return &c
+	return c
 }
 
-func (c *Coordinator) createMapTask(files []string) {
-	for index, file := range files {
-		task := Task{index, -1, -1, READY_FOR_MAPPING, file}
-		c.mapList = append(c.mapList, task)
+func (c *Coordinator) cleanIdleTasks() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now().Unix()
+	for _, t := range c.allTasks {
+		if t.Status == TaskStatusRunning && now-t.LastActive > 10 {
+			log.Printf("[Coordinator] Task %d timeout\n", t.TaskId)
+			t.Status = TaskStatusCreated
+			c.mapTasks <- t
+		}
 	}
 }
 
-func (c *Coordinator) createReduceTask() {
-	for index := 0; index < c.nReduce; index++ {
-		task := Task{index, index, c.fileSums, READY_FOR_REDUCING, ""}
-		c.reduceList = append(c.reduceList, task)
+func (c *Coordinator) createMapTasks() {
+	files := c.files
+	for i := range files {
+		task := &Task{
+			TaskId:   c.maxTaskId,
+			MapId:    i,
+			NReduce:  c.nReduce,
+			NFiles:   len(files),
+			FileName: files[i],
+			Status:   TaskStatusCreated,
+		}
+		c.maxTaskId++
+
+		c.mapTasks <- task
+		c.allTasks[task.TaskId] = task
+	}
+}
+
+func (c *Coordinator) createReduceTasks() {
+	for i := 0; i < c.nReduce; i++ {
+		task := &Task{
+			TaskId:   c.maxTaskId,
+			ReduceId: i,
+			NFiles:   len(c.files),
+			NReduce:  c.nReduce,
+			Status:   TaskStatusCreated,
+		}
+		c.maxTaskId++
+
+		c.mapTasks <- task
+		c.allTasks[task.TaskId] = task
 	}
 }
