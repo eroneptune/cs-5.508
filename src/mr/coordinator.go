@@ -21,14 +21,21 @@ func init() {
 	log.SetOutput(&NoOutput{})
 }
 
-type Coordinator struct {
-	mapTasks chan *Task
-	allTasks map[int]*Task
-	mu       sync.RWMutex
+const MaxInactiveInSecond = 10
 
-	files     []string
+type Coordinator struct {
+	// 存放Coordinator等待worker获取的任务队列
+	// 包含Map任务以及Reduce任务
+	taskQueue chan *Task
+	// TaskId -> Task的映射，主要处理任务超时
+	allTasks map[int]*Task
+	// 对allTasks的锁
+	mu sync.RWMutex
+
+	// 等待分配的TaskId
 	maxTaskId int
 
+	nFiles   int
 	nReduce  int
 	mrStatus int
 
@@ -36,14 +43,26 @@ type Coordinator struct {
 }
 
 type Task struct {
-	TaskId     int
-	MapId      int
-	ReduceId   int
-	Status     int
-	NFiles     int
-	NReduce    int
-	FileName   string
+	// 标识任务的id
+	TaskId int
+	// 任务状态
+	Status int
+	// 总文件数量
+	NFiles int
+	// reduce数量
+	NReduce int
+	// 任务最后活跃时间
 	LastActive int64
+
+	// Map任务的id
+	// mr-#{MapId}-#{ReduceId}
+	MapId int
+	// Map任务读入的文件名
+	FileName string
+
+	// Reduce任务的id
+	// mr-#{MapId}-#{ReduceId}
+	ReduceId int
 }
 
 func (c *Coordinator) releaseTask(taskId int) int {
@@ -51,15 +70,17 @@ func (c *Coordinator) releaseTask(taskId int) int {
 	delete(c.allTasks, taskId)
 	if len(c.allTasks) == 0 {
 		if c.mrStatus == MRStatusMapping {
+			// Map任务结束，转入Reduce
 			c.mrStatus = MRStatusReducing
 			log.Printf("[Coordinator] Set c to reducing phase\n")
 			c.createReduceTasks()
 			res = MRStatusReducing
 		} else if c.mrStatus == MRStatusReducing {
+			// Reduce任务结束，整个任务结束
 			c.mrStatus = MRStatusCompleted
 			log.Println("[Coordinator] Done")
 			// cleanup
-			close(c.mapTasks)
+			close(c.taskQueue)
 			res = MRStatusCompleted
 		}
 	}
@@ -68,10 +89,13 @@ func (c *Coordinator) releaseTask(taskId int) int {
 }
 
 func (c *Coordinator) RequestForTask(args *RequestForTaskArgs, reply *RequestForTaskReply) error {
+	// 所有任务都完成
 	if c.mrStatus == MRStatusCompleted {
 		reply.Done = true
 		return nil
 	}
+
+	// Worker通知Coordinator任务完成，释放任务并更新新任务
 	if args.Status == TaskStatusCompleted {
 		c.mu.Lock()
 		status := c.releaseTask(args.TaskId)
@@ -82,8 +106,9 @@ func (c *Coordinator) RequestForTask(args *RequestForTaskArgs, reply *RequestFor
 		}
 	}
 
-	if task, ok := <-c.mapTasks; ok {
+	if task, ok := <-c.taskQueue; ok {
 		c.mu.Lock()
+		// 确保任务存在于allTasks中
 		if _, ok = c.allTasks[task.TaskId]; ok {
 			task.LastActive = time.Now().Unix()
 			task.Status = TaskStatusRunning
@@ -138,18 +163,17 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	nfiles := len(files)
 	c := &Coordinator{
-		mapTasks:  make(chan *Task, nfiles+10),
+		taskQueue: make(chan *Task, len(files)+10),
 		allTasks:  make(map[int]*Task),
 		nReduce:   nReduce,
 		maxTaskId: 0,
-		files:     files,
+		nFiles:    len(files),
 		mrStatus:  MRStatusMapping,
 		ticker:    time.NewTicker(3 * time.Second),
 	}
 
-	c.createMapTasks()
+	c.createMapTasks(files)
 	go func() {
 		for {
 			select {
@@ -168,28 +192,27 @@ func (c *Coordinator) cleanIdleTasks() {
 
 	now := time.Now().Unix()
 	for _, t := range c.allTasks {
-		if t.Status == TaskStatusRunning && now-t.LastActive > 10 {
+		if t.Status == TaskStatusRunning && now-t.LastActive > MaxInactiveInSecond {
 			log.Printf("[Coordinator] Task %d timeout\n", t.TaskId)
 			t.Status = TaskStatusCreated
-			c.mapTasks <- t
+			c.taskQueue <- t
 		}
 	}
 }
 
-func (c *Coordinator) createMapTasks() {
-	files := c.files
+func (c *Coordinator) createMapTasks(files []string) {
 	for i := range files {
 		task := &Task{
 			TaskId:   c.maxTaskId,
 			MapId:    i,
 			NReduce:  c.nReduce,
-			NFiles:   len(files),
+			NFiles:   c.nFiles,
 			FileName: files[i],
 			Status:   TaskStatusCreated,
 		}
 		c.maxTaskId++
 
-		c.mapTasks <- task
+		c.taskQueue <- task
 		c.allTasks[task.TaskId] = task
 	}
 }
@@ -199,13 +222,13 @@ func (c *Coordinator) createReduceTasks() {
 		task := &Task{
 			TaskId:   c.maxTaskId,
 			ReduceId: i,
-			NFiles:   len(c.files),
+			NFiles:   c.nFiles,
 			NReduce:  c.nReduce,
 			Status:   TaskStatusCreated,
 		}
 		c.maxTaskId++
 
-		c.mapTasks <- task
+		c.taskQueue <- task
 		c.allTasks[task.TaskId] = task
 	}
 }

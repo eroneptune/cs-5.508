@@ -37,6 +37,7 @@ func ihash(key string) int {
 }
 
 type AWorker struct {
+	// 当前任务
 	task    *Task
 	mapf    func(string, string) []KeyValue
 	reducef func(string, []string) string
@@ -146,8 +147,8 @@ func (w *AWorker) process() {
 	for {
 		args := &RequestForTaskArgs{}
 		reply := &RequestForTaskReply{}
-		// Task done
 		if w.task != nil {
+			// 任务完成，提交任务
 			args.TaskId = w.task.TaskId
 			args.Status = TaskStatusCompleted
 			log.Printf("[Worker] complete task %d", args.TaskId)
@@ -193,6 +194,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	worker.ticker.Stop()
 }
 
+// 开始发送心跳的ticker
 func (w *AWorker) startTicker() {
 	go func() {
 		for {
