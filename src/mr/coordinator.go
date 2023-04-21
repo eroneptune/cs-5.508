@@ -2,7 +2,6 @@ package mr
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -14,28 +13,29 @@ import (
 
 type Coordinator struct {
 	// Your definitions here.
-	mapList       []Task
-	mapMutex      sync.Mutex
-	reduceList    []Task
-	reduceMutex   sync.Mutex
-	completeList  []Task
-	completeMutex sync.Mutex
+	mapList     []TaskInfo
+	mapMutex    sync.Mutex
+	reduceList  []TaskInfo
+	reduceMutex sync.Mutex
 
 	workerList  []WorkerInfo
+	MaxWorkerId int
 	workerMutex sync.Mutex
-	maxWorkerId int
-	IdMutex     sync.Mutex
 
-	nReduce  int
-	mrStatus int
-	fileSums int
+	mrStatus    int
+	statusMutex sync.Mutex
+
+	nReduce int
+	fileSum int
+	ticker  *time.Ticker
 }
 
 type WorkerInfo struct {
 	WorkerId      int
 	Status        int
 	CurrentTaskId int
-	timestamp     int64
+	Timestamp     int64
+	mutex         sync.Mutex
 }
 
 type Task struct {
@@ -46,16 +46,22 @@ type Task struct {
 	FileName string
 }
 
+type TaskInfo struct {
+	Task  Task
+	mutex sync.Mutex
+}
+
 func (c *Coordinator) Call(args *RequestArgs, reply *RequestReply) error {
 	worker := c.fetchWorker(args.WorkerId)
 	if worker == nil {
 		return errors.New("Invalid WorkerId")
 	}
-	worker.timestamp = time.Now().Unix()
+	worker.Timestamp = time.Now().Unix()
 
 	if worker.CurrentTaskId != INVALID_TASK_ID {
 		e := c.updateWorkerAndTask(worker)
 		if e != nil {
+			worker.mutex.Unlock()
 			return e
 		}
 	}
@@ -63,28 +69,30 @@ func (c *Coordinator) Call(args *RequestArgs, reply *RequestReply) error {
 	if task == nil {
 		// TODO
 		reply.NReduce = -1
-		reply.Worker = *worker
+		reply.WorkerId = worker.WorkerId
+		worker.mutex.Unlock()
 		return nil
 	}
-	worker.CurrentTaskId = task.TaskId
-	worker.Status = c.mrStatus
+	worker.CurrentTaskId = task.Task.TaskId
 
-	reply.Worker = *worker
-	reply.Task = *task
+	reply.WorkerId = worker.WorkerId
+	reply.Task = task.Task
 	reply.NReduce = c.nReduce
-	if worker.Status == REDUCING_WORKER {
-		fmt.Println(reply.Task.TaskId, reply.Task.ReduceId, reply.Task.FileSum)
-		time.Sleep(500 * time.Millisecond)
-	}
 
+	task.mutex.Unlock()
+	worker.mutex.Unlock()
 	return nil
 }
 
 func (c *Coordinator) Register(args *RequestArgs, reply *RequestReply) error {
-	worker := WorkerInfo{c.maxWorkerId, IDLE_WORKER, INVALID_TASK_ID, time.Now().Unix()}
+	c.workerMutex.Lock()
+	defer c.workerMutex.Unlock()
+
+	worker := WorkerInfo{c.MaxWorkerId, IDLE_WORKER, INVALID_TASK_ID, time.Now().Unix(), sync.Mutex{}}
 	c.workerList = append(c.workerList, worker)
-	c.maxWorkerId += 1
-	reply.Worker = worker
+	reply.WorkerId = worker.WorkerId
+	c.MaxWorkerId += 1
+
 	return nil
 }
 
@@ -93,107 +101,164 @@ func (c *Coordinator) PingPong(args *RequestArgs, reply *RequestReply) error {
 	if worker == nil {
 		return errors.New("Invalid WorkerId")
 	}
-	worker.timestamp = time.Now().Unix()
+	worker.Timestamp = time.Now().Unix()
+	worker.mutex.Unlock()
 	return nil
+}
+
+func (c *Coordinator) Timeout() {
+	c.workerMutex.Lock()
+
+	for index := range c.workerList {
+		if c.workerList[index].WorkerId != REMOVED_WORKER && c.workerList[index].Timestamp+10 < time.Now().Unix() {
+			c.workerList[index].mutex.Lock()
+			c.ReleaseTask(c.workerList[index].CurrentTaskId)
+			c.workerList[index].WorkerId = REMOVED_WORKER
+			c.workerList[index].mutex.Unlock()
+		}
+	}
+	c.workerMutex.Unlock()
+}
+
+func (c *Coordinator) ReleaseTask(taskId int) {
+	if taskId == INVALID_TASK_ID {
+		return
+	}
+
+	c.statusMutex.Lock()
+
+	if c.mrStatus == MAPPING_WORKER {
+		c.mapMutex.Lock()
+		c.statusMutex.Unlock()
+		defer c.mapMutex.Unlock()
+
+		for index := range c.mapList {
+			if c.mapList[index].Task.TaskId == taskId {
+				c.mapList[index].mutex.Lock()
+				c.mapList[index].Task.Status = READY_FOR_MAPPING
+				c.mapList[index].mutex.Unlock()
+				return
+			}
+		}
+
+	} else if c.mrStatus == REDUCING_WORKER {
+		c.reduceMutex.Lock()
+		c.statusMutex.Unlock()
+		defer c.reduceMutex.Unlock()
+
+		for index := range c.reduceList {
+			if c.reduceList[index].Task.TaskId == taskId {
+				c.reduceList[index].mutex.Lock()
+				c.reduceList[index].Task.Status = READY_FOR_REDUCING
+				c.reduceList[index].mutex.Unlock()
+				return
+			}
+		}
+
+	}
 }
 
 func (c *Coordinator) updateWorkerAndTask(worker *WorkerInfo) error {
-	task := c.fetchTask(worker.CurrentTaskId)
-	if task == nil {
-		return errors.New("Invalid TaskId")
+	c.statusMutex.Lock()
+	defer c.statusMutex.Unlock()
+
+	if c.mrStatus == MAPPING_WORKER {
+		index := -1
+		c.mapMutex.Lock()
+		defer c.mapMutex.Unlock()
+
+		for i := range c.mapList {
+			if c.mapList[i].Task.TaskId == worker.CurrentTaskId {
+				index = i
+				break
+			}
+		}
+		// task not exists
+		if index == -1 {
+
+			return errors.New("Invalid TaskId")
+		}
+
+		c.mapList = append(c.mapList[:index], c.mapList[(index+1):]...)
+		if len(c.mapList) == 0 {
+			// map phase complete
+			c.createReduceTask()
+			c.mrStatus = REDUCING_WORKER
+		}
+	} else if c.mrStatus == REDUCING_WORKER {
+		index := -1
+		c.reduceMutex.Lock()
+		defer c.reduceMutex.Unlock()
+
+		for i := range c.reduceList {
+			if c.reduceList[i].Task.TaskId == worker.CurrentTaskId {
+				index = i
+				break
+			}
+		}
+		// task not exists
+		if index == -1 {
+
+			return errors.New("Invalid TaskId")
+		}
+
+		c.reduceList = append(c.reduceList[:index], c.reduceList[(index+1):]...)
+		if len(c.reduceList) == 0 {
+			// reduce phase complete
+			c.mrStatus = IDLE_WORKER
+		}
 	}
 
-	worker.Status = IDLE_WORKER
 	worker.CurrentTaskId = INVALID_TASK_ID
-
-	if task.Status == MAPPING {
-		task.Status = READY_FOR_REDUCING
-		c.mapToReduce(task.TaskId)
-	} else if task.Status == REDUCING {
-		task.Status = COMPLETED
-		c.reduceToComplete(task.TaskId)
-	}
 
 	return nil
 }
 
-func (c *Coordinator) mapToReduce(taskId int) {
-	var index int
-	for i, task := range c.mapList {
-		if task.TaskId == taskId {
-			index = i
-			break
-		}
-	}
-
-	c.mapList = append(c.mapList[:index], c.mapList[(index+1):]...)
-	if len(c.mapList) == 0 {
-		c.createReduceTask()
-		c.mrStatus = REDUCING_WORKER
-		fmt.Println("finish")
-	}
-}
-
-func (c *Coordinator) reduceToComplete(taskId int) {
-	var index int
-	for i, task := range c.reduceList {
-		if task.TaskId == taskId {
-			index = i
-			break
-		}
-	}
-
-	c.reduceList = append(c.reduceList[:index], c.reduceList[(index+1):]...)
-	if len(c.reduceList) == 0 {
-		c.mrStatus = IDLE_WORKER
-	}
-}
-
 func (c *Coordinator) fetchWorker(workerId int) *WorkerInfo {
+	c.workerMutex.Lock()
+	defer c.workerMutex.Unlock()
+
 	for index := range c.workerList {
 		if c.workerList[index].WorkerId == workerId {
+			c.workerList[index].mutex.Lock()
 			return &c.workerList[index]
 		}
 	}
 	return nil
 }
 
-func (c *Coordinator) fetchTask(taskId int) *Task {
-	if c.mrStatus == MAPPING_WORKER {
-		for index := range c.mapList {
-			if c.mapList[index].TaskId == taskId {
-				return &c.mapList[index]
-			}
-		}
-	} else if c.mrStatus == REDUCING_WORKER {
-		for index := range c.reduceList {
-			if c.reduceList[index].TaskId == taskId {
-				return &c.reduceList[index]
-			}
-		}
-	}
+func (c *Coordinator) allocTask() *TaskInfo {
+	c.statusMutex.Lock()
 
-	return nil
-}
-
-func (c *Coordinator) allocTask() *Task {
 	// need refactor
 	if c.mrStatus == MAPPING_WORKER {
+		c.mapMutex.Lock()
+		c.statusMutex.Unlock()
+		defer c.mapMutex.Unlock()
+
 		for index := range c.mapList {
-			if c.mapList[index].Status == READY_FOR_MAPPING {
-				c.mapList[index].Status = MAPPING
+			if c.mapList[index].Task.Status == READY_FOR_MAPPING {
+				c.mapList[index].mutex.Lock()
+				c.mapList[index].Task.Status = MAPPING
 				return &c.mapList[index]
 			}
 		}
+		return nil
 	} else if c.mrStatus == REDUCING_WORKER {
+		c.reduceMutex.Lock()
+		c.statusMutex.Unlock()
+		defer c.reduceMutex.Unlock()
+
 		for index := range c.reduceList {
-			if c.reduceList[index].Status == READY_FOR_REDUCING {
-				c.reduceList[index].Status = REDUCING
+			if c.reduceList[index].Task.Status == READY_FOR_REDUCING {
+				c.reduceList[index].mutex.Lock()
+				c.reduceList[index].Task.Status = REDUCING
 				return &c.reduceList[index]
 			}
 		}
+		return nil
 	}
-
+	c.statusMutex.Unlock()
 	return nil
 }
 
@@ -224,25 +289,39 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 	c.nReduce = nReduce
-	c.maxWorkerId = 0
+	c.MaxWorkerId = 0
 	c.mrStatus = MAPPING_WORKER
-	c.fileSums = len(files)
+	c.fileSum = len(files)
 	// Your code here.
+
 	c.createMapTask(files)
 	c.server()
+	c.ticker = time.NewTicker(1 * time.Second)
+	go c.CoordinatorHandler(c.ticker)
 	return &c
 }
 
+func (c *Coordinator) CoordinatorHandler(ticker *time.Ticker) {
+	for {
+		select {
+		case <-ticker.C:
+			go c.Timeout()
+		}
+	}
+}
+
 func (c *Coordinator) createMapTask(files []string) {
+	c.mapMutex.Lock()
 	for index, file := range files {
-		task := Task{index, -1, -1, READY_FOR_MAPPING, file}
+		task := TaskInfo{Task{index, -1, -1, READY_FOR_MAPPING, file}, sync.Mutex{}}
 		c.mapList = append(c.mapList, task)
 	}
+	c.mapMutex.Unlock()
 }
 
 func (c *Coordinator) createReduceTask() {
 	for index := 0; index < c.nReduce; index++ {
-		task := Task{index, index, c.fileSums, READY_FOR_REDUCING, ""}
+		task := TaskInfo{Task{index, index, c.fileSum, READY_FOR_REDUCING, ""}, sync.Mutex{}}
 		c.reduceList = append(c.reduceList, task)
 	}
 }

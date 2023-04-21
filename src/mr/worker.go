@@ -45,9 +45,10 @@ func Worker(mapf func(string, string) []KeyValue,
 	if !registerSuccess {
 		fmt.Printf("register failed!\n")
 	}
+	ticker := time.NewTicker(1 * time.Second)
+	go WorkerHandler(ticker, reply.WorkerId)
 
-	worker := WorkerInfo{reply.Worker.WorkerId, IDLE_WORKER, INVALID_TASK_ID, time.Now().Unix()}
-	args := RequestArgs{worker.WorkerId, IDLE_WORKER}
+	args := RequestArgs{reply.WorkerId, IDLE_WORKER}
 
 	for {
 		reply := RequestReply{}
@@ -59,16 +60,16 @@ func Worker(mapf func(string, string) []KeyValue,
 
 				// sleep 500ms
 				time.Sleep(500 * time.Millisecond)
-			} else if reply.Worker.Status == MAPPING_WORKER {
+			} else if reply.Task.Status == MAPPING {
 				// map
 				content, err := readFile(reply.Task.FileName)
 				if err != nil {
 					// TODO
 					return
 				}
-				kva := mapf(strconv.Itoa(reply.Task.TaskId), content)
+				kva := mapf(reply.Task.FileName, content)
 				hashIntermediate(kva, reply.Task.TaskId, reply.NReduce)
-			} else if reply.Worker.Status == REDUCING_WORKER {
+			} else if reply.Task.Status == REDUCING {
 				// reduce
 				// reply.Task.reduceId  => reduceId
 				// reply.Task.TaskId		=> max taskId
@@ -78,15 +79,10 @@ func Worker(mapf func(string, string) []KeyValue,
 					content, err := readFile("mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reduceId))
 					if err != nil {
 						// TODO
-						fmt.Println("error")
-						return
+						// fmt.Println("error")
 					}
 					kva := []KeyValue{}
 					err = json.Unmarshal([]byte(content), &kva)
-					if err != nil {
-						// TODO
-						return
-					}
 					allKva = append(allKva, kva...)
 				}
 				sort.Sort(ByKey(allKva))
@@ -114,6 +110,21 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 }
 
+func WorkerHandler(ticker *time.Ticker, workerId int) {
+	for {
+		select {
+		case <-ticker.C:
+			go workerHeartBeat(workerId)
+		}
+	}
+}
+
+func workerHeartBeat(workerId int) {
+	args := RequestArgs{workerId, IDLE_WORKER}
+	reply := RequestReply{}
+	call("Coordinator.PingPong", &args, &reply)
+}
+
 func hashIntermediate(kva []KeyValue, taskId int, nReduce int) {
 	intermediate := make(map[int][]KeyValue)
 	for _, val := range kva {
@@ -131,7 +142,6 @@ func hashIntermediate(kva []KeyValue, taskId int, nReduce int) {
 }
 
 func readFile(fileName string) (string, error) {
-	fmt.Println(fileName)
 	result := ""
 	file, err := os.Open(fileName)
 	if err != nil {

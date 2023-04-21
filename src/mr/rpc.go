@@ -39,6 +39,7 @@ const (
 
 const (
 	INVALID_WORKER_ID = -1
+	REMOVED_WORKER    = -2
 )
 
 const (
@@ -51,7 +52,7 @@ type RequestArgs struct {
 }
 
 type RequestReply struct {
-	Worker  WorkerInfo
-	Task    Task
-	NReduce int
+	WorkerId int
+	Task     Task
+	NReduce  int
 }
