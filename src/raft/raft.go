@@ -63,8 +63,7 @@ type Log struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex // Lock to protect shared access to this peer's state
-	msgOrder  sync.Mutex
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -81,8 +80,8 @@ type Raft struct {
 
 	// persistent state
 	currentTerm   int64
-	voteFor       int   // CandidateId that received vote in current Term (or null if none)
-	log           []Log // TODO
+	voteFor       int // CandidateId that received vote in current Term (or null if none)
+	log           []Log
 	snapshotTerm  int64
 	snapshotIndex int
 	snapshot      []byte
@@ -146,6 +145,8 @@ func (rf *Raft) persist() { // TODO
 	e.Encode(rf.snapshotIndex)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, rf.snapshot)
+
+	// rf.readPersist2(rf.persister.ReadRaftState())
 }
 
 // restore previously persisted state.
@@ -388,7 +389,6 @@ func (rf *Raft) leaderElection() {
 	rf.currentTerm++
 	t := rf.currentTerm
 	me := rf.me
-
 	req := &RequestVoteArgs{
 		Term:         t,
 		CandidateId:  me,
@@ -417,7 +417,7 @@ func (rf *Raft) startHeartBeat() {
 			if rf.state == Leader {
 				rf.sendHeartBeat()
 			}
-			rf.leaderTimer.Reset(150 * time.Millisecond)
+			rf.leaderTimer.Reset(120 * time.Millisecond)
 			rf.mu.Unlock()
 		}
 	}
@@ -518,6 +518,7 @@ func (rf *Raft) sendHeartBeat() {
 						rf.mu.Unlock()
 
 					} else {
+
 						rf.matchIndex[idx] = args.PrevLogIndex + len(args.Entries)
 						rf.nextIndex[idx] = rf.matchIndex[idx] + 1
 						rf.updateCommitIndex()
@@ -664,10 +665,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if len(args.Entries) != 0 {
-		// match! Append any new entries not already in the log
-		rf.log = append(rf.log[:(args.PrevLogIndex-rf.snapshotIndex+1)], args.Entries...)
+	index := args.PrevLogIndex
+	for i := 0; i < len(args.Entries); i++ {
+		index++
+		if index <= rf.GetLastLogIndex() {
+			if rf.GetLogTerm(index) == args.Entries[i].Term {
+				continue
+			} else {
+				rf.log = rf.log[:(index - rf.snapshotIndex)]
+			}
+		}
+		rf.log = append(rf.log, args.Entries[i:]...)
 		rf.persist()
+		break
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -716,11 +726,11 @@ func (rf *Raft) applyLog() {
 	if rf.lastApplied == rf.commitIndex || rf.GetLogTerm(rf.commitIndex) < rf.currentTerm {
 		return
 	}
-
 	entries := make([]Log, rf.commitIndex-rf.lastApplied)
 	copy(entries, rf.log[(rf.lastApplied-rf.snapshotIndex+1):(rf.commitIndex-rf.snapshotIndex+1)])
-	rf.lastApplied = rf.commitIndex
+	temp := rf.commitIndex
 	rf.mu.Unlock() //create a snapshot, release the lock, or it will deadlock
+
 	for _, log := range entries {
 		applyMsg := ApplyMsg{
 			CommandValid: true,
@@ -730,6 +740,9 @@ func (rf *Raft) applyLog() {
 		rf.applyCh <- applyMsg
 	}
 	rf.mu.Lock()
+	if rf.lastApplied < temp {
+		rf.lastApplied = temp
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -757,10 +770,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { // TODO
 	term := rf.currentTerm
 	rf.log = append(rf.log, Log{term, newIndex, command})
 	rf.persist()
-
 	// update nextIndex and matchIndex
 	rf.nextIndex[rf.me] = rf.GetLastLogIndex() + 1
 	rf.matchIndex[rf.me] = rf.GetLastLogIndex()
+
+	rf.leaderTimer.Reset(time.Microsecond)
 
 	// return index, term, isLeader
 	return newIndex, int(term), true
@@ -814,7 +828,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 	// volatile state on leaders
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
