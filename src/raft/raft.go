@@ -253,20 +253,10 @@ func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotResp) {
 
 	if rf.GetLastLogIndex() > args.LastIncludedIndex {
 		// discard the log before the snapshot
-		rf.log = rf.log[args.LastIncludedIndex-rf.GetLastLogIndex():]
+		rf.log = rf.log[(args.LastIncludedIndex - rf.snapshotIndex):]
 	} else {
 		// discard the entire log
 		rf.log = []Log{{Term: args.LastIncludedTerm, Index: args.LastIncludedIndex}}
-	}
-
-	if args.LastIncludedIndex > rf.commitIndex {
-		// update the commitIndex
-		rf.commitIndex = args.LastIncludedIndex
-	}
-
-	if args.LastIncludedIndex > rf.lastApplied {
-		// update the lastApplied
-		rf.lastApplied = args.LastIncludedIndex
 	}
 
 	rf.snapshotIndex = args.LastIncludedIndex
@@ -281,6 +271,18 @@ func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotResp) {
 		SnapshotTerm:  int(args.LastIncludedTerm),
 		SnapshotIndex: args.LastIncludedIndex,
 	}
+
+	rf.mu.Lock()
+	if args.LastIncludedIndex > rf.commitIndex {
+		// update the commitIndex
+		rf.commitIndex = args.LastIncludedIndex
+	}
+
+	if args.LastIncludedIndex > rf.lastApplied {
+		// update the lastApplied
+		rf.lastApplied = args.LastIncludedIndex
+	}
+	rf.mu.Unlock()
 }
 
 // example RequestVote RPC arguments structure.
@@ -463,9 +465,10 @@ func (rf *Raft) sendHeartBeat() {
 						return
 					}
 
-					rf.matchIndex[idx] = rf.snapshotIndex
-					rf.nextIndex[idx] = rf.matchIndex[idx] + 1
-
+					if args.LastIncludedIndex > rf.matchIndex[idx] {
+						rf.matchIndex[idx] = args.LastIncludedIndex
+						rf.nextIndex[idx] = rf.matchIndex[idx] + 1
+					}
 					rf.updateCommitIndex()
 					rf.mu.Unlock()
 				} else {
@@ -518,8 +521,9 @@ func (rf *Raft) sendHeartBeat() {
 						rf.mu.Unlock()
 
 					} else {
-
-						rf.matchIndex[idx] = args.PrevLogIndex + len(args.Entries)
+						if args.PrevLogIndex+len(args.Entries) > rf.matchIndex[idx] {
+							rf.matchIndex[idx] = args.PrevLogIndex + len(args.Entries)
+						}
 						rf.nextIndex[idx] = rf.matchIndex[idx] + 1
 						rf.updateCommitIndex()
 						rf.mu.Unlock()
@@ -650,6 +654,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	if args.PrevLogIndex < rf.snapshotIndex {
+		reply.Term = rf.currentTerm
+		reply.Xlen = rf.snapshotIndex + 1
+		return
+	}
+
 	if rf.GetLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
 		// log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 		reply.Term = rf.currentTerm
@@ -723,9 +733,10 @@ func (rf *Raft) updateCommitIndex() {
 }
 
 func (rf *Raft) applyLog() {
-	if rf.lastApplied == rf.commitIndex || rf.GetLogTerm(rf.commitIndex) < rf.currentTerm {
+	if rf.lastApplied == rf.commitIndex || rf.lastApplied < rf.snapshotIndex || rf.GetLogTerm(rf.commitIndex) < rf.currentTerm {
 		return
 	}
+
 	entries := make([]Log, rf.commitIndex-rf.lastApplied)
 	copy(entries, rf.log[(rf.lastApplied-rf.snapshotIndex+1):(rf.commitIndex-rf.snapshotIndex+1)])
 	temp := rf.commitIndex

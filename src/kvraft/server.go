@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -50,12 +51,13 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
 	lastApplied   int
 	clientSession map[int64]int // state machine maintains a session for each client
 	opChannel     map[OpId]chan ApplyResult
-	KVDataBase    map[string]string
+	kvDataBase    map[string]string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -150,6 +152,48 @@ func (kv *KVServer) DeleteOpChan(index int, term int) {
 	delete(kv.opChannel, OpId{index: index, term: term})
 }
 
+func (kv *KVServer) installSnapshot(snapshot []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if len(snapshot) == 0 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var kvDataBase map[string]string
+	var clientSession map[int64]int
+
+	if d.Decode(&kvDataBase) != nil ||
+		d.Decode(&clientSession) != nil {
+		// error...
+	} else {
+		kv.kvDataBase = kvDataBase
+		kv.clientSession = clientSession
+	}
+
+}
+
+func (kv *KVServer) updateSnapshot(index int) {
+	kv.mu.Lock()
+
+	if kv.maxraftstate == -1 || kv.persister.RaftStateSize()+100 < kv.maxraftstate {
+		kv.mu.Unlock()
+		return
+	}
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvDataBase)
+	e.Encode(kv.clientSession)
+	snapshot := w.Bytes()
+
+	kv.mu.Unlock()
+	kv.rf.Snapshot(index, snapshot)
+}
+
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -172,8 +216,15 @@ func (kv *KVServer) killed() bool {
 func (kv *KVServer) applyMsg() {
 	for kv.killed() == false {
 		for msg := range kv.applyCh {
-			if false {
-				// snapshot
+			if msg.SnapshotValid {
+				if kv.lastApplied >= msg.SnapshotIndex {
+					// the log has already been applied
+
+					continue
+				}
+				// install snapshot
+				kv.installSnapshot(msg.Snapshot)
+				kv.lastApplied = msg.SnapshotIndex
 			} else {
 				// append entry
 				if kv.lastApplied >= msg.CommandIndex {
@@ -183,8 +234,9 @@ func (kv *KVServer) applyMsg() {
 				op := msg.Command.(Op)
 				result := kv.applyOperation(op)
 				kv.lastApplied = msg.CommandIndex
-				term, isleader := kv.rf.GetState()
+				kv.updateSnapshot(msg.CommandIndex)
 
+				term, isleader := kv.rf.GetState()
 				if !isleader {
 					continue
 				}
@@ -207,11 +259,11 @@ func (kv *KVServer) applyOperation(op Op) ApplyResult {
 		switch op.Op {
 		case "Get":
 			result.err = OK
-			result.value = kv.KVDataBase[op.Key]
+			result.value = kv.kvDataBase[op.Key]
 		case "Put":
-			kv.KVDataBase[op.Key] = op.Value
+			kv.kvDataBase[op.Key] = op.Value
 		case "Append":
-			kv.KVDataBase[op.Key] = kv.KVDataBase[op.Key] + op.Value
+			kv.kvDataBase[op.Key] = kv.kvDataBase[op.Key] + op.Value
 		default:
 		}
 
@@ -221,7 +273,7 @@ func (kv *KVServer) applyOperation(op Op) ApplyResult {
 
 	if op.Op == "Get" {
 		result.err = OK
-		result.value = kv.KVDataBase[op.Key]
+		result.value = kv.kvDataBase[op.Key]
 	}
 
 	return result
@@ -247,11 +299,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.clientSession = make(map[int64]int)
 	kv.opChannel = make(map[OpId]chan ApplyResult)
-	kv.KVDataBase = make(map[string]string)
+	kv.kvDataBase = make(map[string]string)
+	kv.installSnapshot(kv.persister.ReadSnapshot())
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
