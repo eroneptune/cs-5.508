@@ -219,10 +219,10 @@ func (kv *KVServer) applyMsg() {
 			if msg.SnapshotValid {
 				if kv.lastApplied >= msg.SnapshotIndex {
 					// the log has already been applied
-
 					continue
 				}
 				// install snapshot
+				// fmt.Println(kv.me, "install snap", msg.SnapshotIndex)
 				kv.installSnapshot(msg.Snapshot)
 				kv.lastApplied = msg.SnapshotIndex
 			} else {

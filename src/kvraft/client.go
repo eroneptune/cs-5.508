@@ -63,10 +63,6 @@ func (ck *Clerk) Get(key string) string {
 			return reply.Value
 		}
 
-		// if reply.Err == "ErrNoKey" {
-		// 	return ""
-		// }
-
 		if !ok || reply.Err == "ErrWrongLeader" {
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 		}
