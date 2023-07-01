@@ -145,8 +145,6 @@ func (rf *Raft) persist() { // TODO
 	e.Encode(rf.snapshotIndex)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, rf.snapshot)
-
-	// rf.readPersist2(rf.persister.ReadRaftState())
 }
 
 // restore previously persisted state.
@@ -496,7 +494,7 @@ func (rf *Raft) sendHeartBeat() {
 						return
 					}
 
-					if !reply.Success { // TODO
+					if !reply.Success {
 						if reply.Xlen != 0 {
 							// follower's log is too short:
 							rf.nextIndex[idx] = reply.Xlen
